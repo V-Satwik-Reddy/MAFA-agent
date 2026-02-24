@@ -1,6 +1,6 @@
 """Execution Agent — handles trade orders with safety checks."""
 
-from langchain.agents import create_agent
+from langgraph.prebuilt import create_react_agent
 
 from agents.base import model, run_agent_turn
 from tools.execute_trade_tools import buy_stock, sell_stock
@@ -67,7 +67,7 @@ Style
 - Be concise and directive. Use short paragraphs or bullets. Avoid over-explaining.
 """
 
-agent = create_agent(model=model, tools=tools, system_prompt=BASE_SYSTEM_PROMPT)
+agent = create_react_agent(model=model, tools=tools, prompt=BASE_SYSTEM_PROMPT)
 
 
 def run_execute_agent(user_message: str, user_id: int) -> str:

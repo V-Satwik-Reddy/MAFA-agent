@@ -1,6 +1,6 @@
 """Portfolio Manager Agent — data-driven portfolio analysis and recommendations."""
 
-from langchain.agents import create_agent
+from langgraph.prebuilt import create_react_agent
 
 from agents.base import model, run_agent_turn
 from tools.profile_tools import (
@@ -88,7 +88,7 @@ Style
 - Always note that data is point-in-time and not investment advice.
 """
 
-agent = create_agent(tools=tools, model=model, system_prompt=BASE_SYSTEM_PROMPT)
+agent = create_react_agent(model=model, tools=tools, prompt=BASE_SYSTEM_PROMPT)
 
 
 def run_portfolio_manager_agent(user_message: str, user_id: int) -> str:

@@ -4,7 +4,7 @@ Provides personalized strategy guidance, allocation plans, and adherence checks.
 Leans on structured tools for consistency while sharing memory via Supabase.
 """
 
-from langchain.agents import create_agent
+from langgraph.prebuilt import create_react_agent
 
 from agents.base import model, run_agent_turn
 from tools.investment_strategy_tools import (
@@ -95,10 +95,10 @@ Operating flow
 """
 
 
-agent = create_agent(
+agent = create_react_agent(
     model=model,
     tools=tools,
-    system_prompt=BASE_SYSTEM_PROMPT,
+    prompt=BASE_SYSTEM_PROMPT,
 )
 
 

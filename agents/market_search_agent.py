@@ -1,6 +1,6 @@
 """Market Search Agent — equity insights, LSTM predictions, and live news."""
 
-from langchain.agents import create_agent
+from langgraph.prebuilt import create_react_agent
 
 from agents.base import model, run_agent_turn
 from tools.market_research_tools import predict, search_live_news, get_all_companies, get_all_sectors
@@ -45,7 +45,7 @@ Operating flow
 Style
 - Be concise, specific, and source-aware; avoid long essays. Use bullets only when they improve clarity.
 """
-agent = create_agent(model=model, tools=tools, system_prompt=BASE_SYSTEM_PROMPT)
+agent = create_react_agent(model=model, tools=tools, prompt=BASE_SYSTEM_PROMPT)
 
 
 def run_market_research_agent(user_message: str, user_id: int) -> str:

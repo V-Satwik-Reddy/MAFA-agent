@@ -155,15 +155,22 @@ async def lifespan(app: FastAPI):
     orchestrator = get_mcp_orchestrator()
     await orchestrator.initialize()
     
-    # Initialize event bus and subscribe to results
-    event_bus = get_event_bus()
-    await event_bus.connect()
-    
-    # Subscribe to MCP results for WebSocket streaming
-    async def broadcast_event(event: MCPEvent):
-        await ws_manager.broadcast(event.to_dict())
-    
-    await event_bus.subscribe(MCPTopics.MCP_RESULTS, broadcast_event)
+    # Initialize event bus (Redis) — gracefully degrade if unavailable
+    _event_bus_available = False
+    try:
+        event_bus = get_event_bus()
+        await event_bus.connect()
+
+        # Subscribe to MCP results for WebSocket streaming
+        async def broadcast_event(event: MCPEvent):
+            await ws_manager.broadcast(event.to_dict())
+
+        await event_bus.subscribe(MCPTopics.MCP_RESULTS, broadcast_event)
+        _event_bus_available = True
+        logger.info("Event bus (Redis) connected")
+    except Exception as exc:
+        logger.warning(f"Redis unavailable — event bus disabled: {exc}")
+        logger.warning("WebSocket streaming and pub/sub will not work. Core agent endpoints are unaffected.")
     
     logger.info("MAFA Agents API started successfully")
     
@@ -172,7 +179,8 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down MAFA Agents API...")
     await orchestrator.shutdown()
-    await shutdown_event_bus()
+    if _event_bus_available:
+        await shutdown_event_bus()
     logger.info("MAFA Agents API shutdown complete")
 
 

@@ -1,6 +1,6 @@
 """General Financial Agent — account info, lookups, and light guidance."""
 
-from langchain.agents import create_agent
+from langgraph.prebuilt import create_react_agent
 from langchain_core.tools import tool
 
 from agents.base import model, run_agent_turn, normalize_content
@@ -91,7 +91,7 @@ Operating rules
 """
 
 
-agent = create_agent(model=model, tools=tools, system_prompt=BASE_SYSTEM_PROMPT)
+agent = create_react_agent(model=model, tools=tools, prompt=BASE_SYSTEM_PROMPT)
 
 
 def run_general_agent(user_message: str, user_id: int) -> str:
