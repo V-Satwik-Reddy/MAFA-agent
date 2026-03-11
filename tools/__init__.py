@@ -2,6 +2,8 @@
 
 Modules
 -------
+_http_helpers               – Shared HTTP helpers (fetch_json, post_json, etc.)
+                              used by all MAFA-B tool modules
 profile_tools              – User balance, holdings, profile, preferences, transactions,
                              dashboard, stock prices (single + bulk), company lookups,
                              portfolio history, watchlist CRUD
