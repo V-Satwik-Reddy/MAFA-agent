@@ -12,20 +12,19 @@ import logging
 import os
 import re
 import time
-from contextlib import asynccontextmanager
+import uuid
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import Tool
 
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 
+from agents.base import model as _shared_model
 from vectordbsupabase import SupabaseVectorDB
 from tools.memory_tools import store_user_context, retrieve_user_context
-from event_bus import MCPEventBus, MCPEvent, MCPTopics, get_event_bus
+from event_bus import MCPEvent, MCPTopics, get_event_bus
 from http_client import get
 
 load_dotenv()
@@ -197,11 +196,8 @@ class TrueMCPOrchestrator:
         self._company_cache: List[Dict[str, Any]] = []
         self._company_cache_ts: float = 0.0
         
-        self.llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            temperature=0.3,
-            google_api_key=os.getenv("GOOGLE_API_KEY"),
-        )
+        # Reuse the shared model from agents.base (avoid creating a duplicate LLM instance)
+        self.llm = _shared_model
         
         self._initialized = False
     
@@ -245,6 +241,10 @@ class TrueMCPOrchestrator:
         """
         start_time = time.time()
         
+        # Auto-generate session_id if not provided
+        if not session_id:
+            session_id = str(uuid.uuid4())
+        
         logger.info(f"MCP orchestration started: user_id={user_id}, query={query[:50]}...")
         
         # Publish query event
@@ -259,7 +259,7 @@ class TrueMCPOrchestrator:
             company_block = await self._check_company_support(query)
             if company_block:
                 from agents.general_agent import run_general_agent_no_broker
-                general_response = run_general_agent_no_broker(query, user_id)
+                general_response = run_general_agent_no_broker(query, user_id, session_id)
                 combined = general_response or company_block
                 await self.event_bus.publish_raw(
                     MCPTopics.MCP_RESULTS,
@@ -360,6 +360,22 @@ class TrueMCPOrchestrator:
         if not query_text:
             return None
 
+        # Skip check for queries about the user's own account / portfolio.
+        # These contain financial words ("stock", "shares") but are NOT about
+        # a specific unsupported company.
+        _account_kw = [
+            "my portfolio", "my holdings", "my stock", "my shares",
+            "my balance", "my watchlist", "my transactions", "my position",
+            "my dashboard", "my profile", "my account", "my strategy",
+            "portfolio", "holdings", "balance", "watchlist", "dashboard",
+            "transactions", "all companies", "all stocks", "tradable",
+            "companies can", "what companies", "list companies", "available companies",
+            "supported stocks", "which stocks",
+        ]
+        q_lower = query_text.lower()
+        if any(kw in q_lower for kw in _account_kw):
+            return None
+
         companies = self._fetch_supported_companies()
         if not companies:
             return None
@@ -413,8 +429,23 @@ class TrueMCPOrchestrator:
         if any(word in q for word in keywords):
             return True
 
-        for token in re.findall(r"\b[A-Z]{1,5}\b", query):
-            if token.isalpha():
+        # Match uppercase tokens that look like tickers (2-5 letters),
+        # excluding common English words that are all-caps by convention.
+        _COMMON_WORDS = {"I", "A", "AM", "AN", "AS", "AT", "BE", "BY", "DO",
+                         "GO", "HE", "IF", "IN", "IS", "IT", "ME", "MY", "NO",
+                         "OF", "OK", "ON", "OR", "SO", "TO", "UP", "US", "WE",
+                         "THE", "AND", "BUT", "FOR", "NOT", "YOU", "ALL", "CAN",
+                         "HER", "WAS", "ONE", "OUR", "OUT", "HAS", "HIS", "HOW",
+                         "ITS", "LET", "MAY", "NEW", "NOW", "OLD", "SEE", "WAY",
+                         "WHO", "DID", "GET", "HIM", "HIT", "HAD", "SAY", "SHE",
+                         "TOO", "USE", "DAD", "MOM", "SET", "RUN", "TRY", "ASK",
+                         "MEN", "RAN", "ANY", "DAY", "FEW", "GOT", "END",
+                         "WHAT", "WHEN", "WILL", "WITH", "THIS", "THAT", "FROM",
+                         "HAVE", "BEEN", "WANT", "SOME", "MUCH", "MANY", "ALSO",
+                         "BEST", "LAST", "NEXT", "HELP", "SHOW", "TELL", "GIVE",
+                         "MAKE", "LIKE", "LOOK", "NEED", "DOES", "THAN"}
+        for token in re.findall(r"\b[A-Z]{2,5}\b", query):
+            if token not in _COMMON_WORDS:
                 return True
         return False
 
@@ -453,22 +484,25 @@ class TrueMCPOrchestrator:
         directly while maintaining the MCP architecture.
         """
         # Build prompt
-        system_message = f"""You are MAFA (Multi-Agent Financial Advisor), an intelligent financial assistant.
+        system_message = f"""You are MAFA (Multi-Agent Financial Advisor), an intelligent financial assistant that coordinates specialised agents.
 
-You have access to specialized tools for:
-- Market Research: Stock predictions using LSTM models, live news search
-- Trade Execution: Buy/sell orders, balance checking, holdings
-- Portfolio Management: Portfolio analysis, allocation, risk metrics
-- Investment Strategy: Personalized recommendations, rebalancing
+Your capabilities via specialised agents:
+• Market Research: LSTM next-day predictions, live news, price analysis (supported tickers: AAPL, AMZN, ADBE, GOOGL, IBM, JPM, META, MSFT, NVDA, ORCL, TSLA)
+• Trade Execution: Buy/sell orders with safety checks, balance verification
+• Portfolio Management: Holdings analysis, P&L, sector concentration, watchlist, alerts
+• Investment Strategy: Risk assessment, allocation planning, strategy persistence
 
-Always use the appropriate tools to answer user queries about stocks and investments.
-Supported stock symbols: AAPL, AMZN, ADBE, GOOGL, IBM, JPM, META, MSFT, NVDA, ORCL, TSLA
+Guidelines:
+- Always use the appropriate tools — never guess data.
+- Be concise and data-driven. Lead with key figures.
+- Note that all data is point-in-time and not personalised investment advice.
+- When multiple agents contribute, synthesise their insights into one coherent answer.
 
 User ID: {user_id}
 Session: {session_id or 'N/A'}
 
-Recent conversation context:
-{context if context else 'No prior context.'}
+Prior context:
+{context if context else 'No prior context available.'}
 """
 
         # For this implementation, we use the existing agent pattern
@@ -486,27 +520,27 @@ Recent conversation context:
         if len(servers_used) == 1:
             server = servers_used[0]
             if server == "market":
-                response = run_market_research_agent(query, user_id)
+                response = run_market_research_agent(query, user_id, session_id)
             elif server == "execution":
-                response = run_execute_agent(query, user_id)
+                response = run_execute_agent(query, user_id, session_id)
             elif server == "portfolio":
-                response = run_portfolio_manager_agent(query, user_id)
+                response = run_portfolio_manager_agent(query, user_id, session_id)
             elif server == "strategy":
-                response = run_investment_strategy_agent(query, user_id)
+                response = run_investment_strategy_agent(query, user_id, session_id)
             else:
-                response = run_general_agent(query, user_id)
+                response = run_general_agent(query, user_id, session_id)
         else:
             # Multi-server query - combine responses
             responses = {}
             
             if "market" in servers_used:
-                responses["market"] = run_market_research_agent(query, user_id)
+                responses["market"] = run_market_research_agent(query, user_id, session_id)
             if "strategy" in servers_used:
-                responses["strategy"] = run_investment_strategy_agent(query, user_id)
+                responses["strategy"] = run_investment_strategy_agent(query, user_id, session_id)
             if "portfolio" in servers_used:
-                responses["portfolio"] = run_portfolio_manager_agent(query, user_id)
+                responses["portfolio"] = run_portfolio_manager_agent(query, user_id, session_id)
             if "execution" in servers_used:
-                responses["execution"] = run_execute_agent(query, user_id)
+                responses["execution"] = run_execute_agent(query, user_id, session_id)
             
             # Synthesize responses
             response = self._synthesize_responses(query, responses)
@@ -518,40 +552,77 @@ Recent conversation context:
         }
     
     def _determine_servers(self, query: str) -> List[str]:
-        """Determine which MCP servers are needed for a query."""
+        """Determine which MCP servers are needed using weighted keyword scoring.
+
+        Each server gets a score based on keyword matches; the top-scoring
+        server(s) are selected.  If no keywords match, fall back to 'general'.
+        """
         q = query.lower()
-        servers = []
         
+        # keyword → weight mappings per server
+        _scores: Dict[str, float] = {"market": 0, "execution": 0, "portfolio": 0, "strategy": 0}
+
         # Market research indicators
-        if any(k in q for k in ["predict", "forecast", "news", "analyze", "research", "price"]):
-            servers.append("market")
-        
+        market_kw = {
+            "predict": 3, "prediction": 3, "forecast": 3, "lstm": 3,
+            "news": 2, "headline": 2, "research": 2, "analyze stock": 2,
+            "analyst": 2, "earnings": 2, "revenue": 1,
+            "price target": 2, "outlook": 2, "momentum": 1,
+            "bull": 1, "bear": 1, "rally": 1, "crash": 1,
+        }
+        for kw, weight in market_kw.items():
+            if kw in q:
+                _scores["market"] += weight
+
         # Execution indicators
-        if any(k in q for k in ["buy", "sell", "trade", "execute", "order"]):
-            servers.append("execution")
-        
+        exec_kw = {
+            "buy": 3, "sell": 3, "trade": 3, "execute": 3, "order": 3,
+            "purchase": 2, "acquire": 2, "dump": 2, "liquidate": 2,
+            "place order": 3, "market order": 3, "limit order": 3,
+        }
+        for kw, weight in exec_kw.items():
+            if kw in q:
+                _scores["execution"] += weight
+
         # Portfolio indicators
-        if any(k in q for k in ["portfolio", "holdings", "allocation", "position"]):
-            servers.append("portfolio")
-        
+        portfolio_kw = {
+            "portfolio": 3, "holdings": 3, "allocation": 2,
+            "position": 2, "dashboard": 2, "watchlist": 2,
+            "p&l": 2, "profit": 1, "loss": 1, "gain": 1,
+            "diversif": 2, "concentration": 2, "weight": 1,
+            "sector breakdown": 3, "performance": 2,
+        }
+        for kw, weight in portfolio_kw.items():
+            if kw in q:
+                _scores["portfolio"] += weight
+
         # Strategy indicators
-        if any(k in q for k in ["recommend", "should i", "invest", "strategy", "rebalance", "advice"]):
-            servers.append("strategy")
-        
-        # Default to general if no specific match
-        if not servers:
-            servers = ["general"]
-        
-        # Investment advice queries typically need multiple servers
-        if "should i invest" in q or "good investment" in q:
-            if "market" not in servers:
-                servers.append("market")
-            if "strategy" not in servers:
-                servers.append("strategy")
-            if "portfolio" not in servers:
-                servers.append("portfolio")
-        
-        return servers
+        strategy_kw = {
+            "strategy": 3, "strateg": 2, "recommend": 2,
+            "should i invest": 3, "should i buy": 2, "good investment": 2,
+            "rebalance": 3, "rebalancing": 3, "risk tolerance": 3,
+            "risk profile": 3, "allocation plan": 3,
+            "conservative": 2, "aggressive": 2, "moderate": 1,
+            "long term": 1, "short term": 1, "time horizon": 2,
+            "advice": 2, "suggest": 1, "plan": 1,
+        }
+        for kw, weight in strategy_kw.items():
+            if kw in q:
+                _scores["strategy"] += weight
+
+        # Sort by score, descending
+        ranked = sorted(_scores.items(), key=lambda x: x[1], reverse=True)
+        top_score = ranked[0][1]
+
+        if top_score == 0:
+            return ["general"]
+
+        # Include all servers that scored at least 50% of the top score
+        threshold = max(top_score * 0.5, 1)
+        servers = [name for name, score in ranked if score >= threshold]
+
+        # Cap at 2 servers to avoid excessive multi-agent calls
+        return servers[:2]
     
     def _synthesize_responses(self, query: str, responses: Dict[str, str]) -> str:
         """Synthesize multiple agent responses into a unified answer."""
@@ -559,7 +630,14 @@ Recent conversation context:
             return list(responses.values())[0]
         
         # Use LLM to synthesize
-        synthesis_prompt = f"""Synthesize these agent responses into a unified, coherent answer.
+        synthesis_prompt = f"""You are MAFA, synthesising multiple specialist agent responses into one unified answer for the user.
+
+Rules:
+1. Merge overlapping insights — don't repeat the same data twice.
+2. Resolve any contradictions by noting both perspectives briefly.
+3. Lead with the most actionable insight, then supporting details.
+4. Keep the total response concise (aim for 4-8 sentences + optional bullets).
+5. End with one clear next step or question for the user.
 
 User Query: {query}
 
@@ -601,8 +679,12 @@ Agent Responses:
         query: str,
         session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Synchronous wrapper for orchestrate()."""
-        return asyncio.get_event_loop().run_until_complete(
+        """Synchronous wrapper for orchestrate().
+
+        Uses asyncio.run() which is safe in all Python 3.10+ contexts,
+        replacing the deprecated get_event_loop().run_until_complete() pattern.
+        """
+        return asyncio.run(
             self.orchestrate(user_id, query, session_id)
         )
 
