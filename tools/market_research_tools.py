@@ -16,11 +16,11 @@ from requests import RequestException
 
 from http_client import get
 from lstm.predict_next_day import predict_next_day_price
+from tools._http_helpers import make_error_response as _err, API_BASE
 
 logger = logging.getLogger(__name__)
 
 # Configuration with environment variable support
-API_BASE = os.getenv("BROKER_API_URL", "http://localhost:8080")
 USE_FALLBACK = os.getenv("USE_FALLBACK_DATA", "true").lower() == "true"
 REQUIRED_COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
@@ -127,33 +127,55 @@ def _fetch_live_news(query: str, num: int = 5) -> List[dict]:
 
 
 @tool
-def predict(ticker: str) -> float:
-    """Predict the next day's closing price using recent OHLCV data from the broker API."""
+def predict(ticker: str) -> str:
+    """Predict the next day's closing price using recent OHLCV data and an LSTM model.
+
+    Returns a JSON string with the predicted price or an error message.
+    Supported tickers: AAPL, AMZN, ADBE, GOOGL, IBM, JPM, META, MSFT, NVDA, ORCL, TSLA.
+    """
+    ticker = ticker.upper().strip()
+    SUPPORTED = {"AAPL", "AMZN", "ADBE", "GOOGL", "IBM", "JPM", "META", "MSFT", "NVDA", "ORCL", "TSLA"}
+    if ticker not in SUPPORTED:
+        return json.dumps({
+            "error": f"Ticker '{ticker}' is not supported for prediction.",
+            "supported_tickers": sorted(SUPPORTED),
+        })
     try:
         records = _fetch_ohlcv(ticker)
         prices_df = _to_dataframe(records)
         prediction_df = predict_next_day_price(ticker, prices_df)
-        return float(prediction_df)
+        predicted_price = float(prediction_df)
+        return json.dumps({"ticker": ticker, "predicted_close": round(predicted_price, 2)})
     except (RequestException, ValueError, TypeError) as exc:
-        print(f"Error predicting next-day price: {exc}")
-        return 0.0
+        logger.warning("Prediction failed for %s: %s", ticker, exc)
+        return json.dumps({"ticker": ticker, "error": f"Prediction failed: {exc}"})
 
 
 @tool
 def search_live_news(query: str) -> str:
-    """Search live news via Google Custom Search and return concise headlines with links."""
+    """Search live news via Google Custom Search and return concise headlines with links.
+
+    If the Custom Search API is not configured, returns a helpful fallback message.
+    """
+    if not CUSTOM_SEARCH_API_KEY or not CUSTOM_SEARCH_CX:
+        return (
+            "Live news search is not configured (missing CUSTOM_SEARCH_API_KEY or CUSTOM_SEARCH_CX). "
+            "Try using google_search on the General Agent for web results, or ask me about "
+            "price data which is available via the broker API."
+        )
     try:
         items = _fetch_live_news(query)
     except (RequestException, ValueError, RuntimeError) as exc:
+        logger.warning("News search failed for '%s': %s", query, exc)
         return f"News search unavailable: {exc}"
     if not items:
-        return "No recent news found."
+        return f"No recent news found for '{query}'."
     lines = []
     for item in items:
         title = item.get("title", "Untitled")
         link = item.get("link", "")
         snippet = item.get("snippet", "")
-        lines.append(f"- {title} | {snippet} | {link}")
+        lines.append(f"- **{title}** — {snippet} [{link}]")
     return "\n".join(lines)
 
 
@@ -173,7 +195,7 @@ def get_all_companies() -> str:
         return json.dumps(data) if data else "[]"
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching companies: {exc}")
-        return "[]"
+        return json.dumps(_err(exc, "get all companies"))
 
 
 @tool
@@ -192,4 +214,4 @@ def get_all_sectors() -> str:
         return json.dumps(data) if data else "[]"
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching sectors: {exc}")
-        return "[]"
+        return json.dumps(_err(exc, "get all sectors"))
