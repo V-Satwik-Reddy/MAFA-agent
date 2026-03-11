@@ -21,43 +21,14 @@ StrategyDto:
 
 import json
 import logging
-import os
 from typing import Any, Dict, Optional
 
 from langchain_core.tools import tool
 from requests import RequestException
 
-from http_client import get, post, put
+from tools._http_helpers import fetch_json as _fetch_json, post_json as _post_json, put_json as _put_json, unwrap as _unwrap, API_BASE, make_error_response as _err
 
 logger = logging.getLogger(__name__)
-
-API_BASE = os.getenv("BROKER_API_URL", "http://localhost:8080")
-
-
-# ── helpers ─────────────────────────────────────────────────────────────────
-
-def _fetch_json(url: str, timeout: int = 10) -> Any:
-    response = get(url, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
-def _post_json(url: str, body: Dict[str, Any], timeout: int = 15) -> Any:
-    response = post(url, json=body, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
-def _put_json(url: str, body: Dict[str, Any], timeout: int = 15) -> Any:
-    response = put(url, json=body, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
-def _unwrap(payload: Any) -> Any:
-    if isinstance(payload, dict) and "data" in payload:
-        return payload["data"]
-    return payload
 
 
 # ── tools ───────────────────────────────────────────────────────────────────
@@ -78,7 +49,7 @@ def get_active_strategy() -> str:
         if hasattr(exc, 'response') and exc.response is not None and exc.response.status_code == 404:
             return "{}"
         logger.warning(f"Error fetching active strategy: {exc}")
-        return "{}"
+        return json.dumps(_err(exc, "get active strategy"))
 
 
 @tool
@@ -94,7 +65,7 @@ def get_strategy_history() -> str:
         return json.dumps(data) if isinstance(data, list) else json.dumps([])
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching strategy history: {exc}")
-        return json.dumps([])
+        return json.dumps(_err(exc, "get strategy history"))
 
 
 @tool
@@ -124,7 +95,7 @@ def save_strategy(strategy_json: str) -> str:
         return json.dumps(data) if data else json.dumps({"error": "Save failed"})
     except RequestException as exc:
         logger.warning(f"Error saving strategy: {exc}")
-        return json.dumps({"error": str(exc)})
+        return json.dumps(_err(exc, "save strategy"))
 
 
 @tool
@@ -148,4 +119,4 @@ def update_strategy(strategy_id: int, updates_json: str) -> str:
         return json.dumps(data) if data else json.dumps({"error": "Update failed"})
     except RequestException as exc:
         logger.warning(f"Error updating strategy {strategy_id}: {exc}")
-        return json.dumps({"error": str(exc)})
+        return json.dumps(_err(exc, f"update strategy {strategy_id}"))
