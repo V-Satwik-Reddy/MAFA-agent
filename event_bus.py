@@ -90,96 +90,10 @@ class MCPEvent:
         return cls.from_dict(json.loads(json_str))
 
 
-@dataclass
-class MarketPredictionEvent(MCPEvent):
-    """Market prediction event with LSTM results."""
-    
-    @classmethod
-    def create(
-        cls,
-        user_id: int,
-        symbol: str,
-        predicted_price: float,
-        current_price: float,
-        model: str = "LSTM",
-        session_id: Optional[str] = None,
-    ) -> "MarketPredictionEvent":
-        return cls(
-            topic=MCPTopics.MARKET_PREDICTIONS,
-            user_id=user_id,
-            payload={
-                "symbol": symbol,
-                "predicted_price": predicted_price,
-                "current_price": current_price,
-                "model": model,
-                "change_pct": ((predicted_price - current_price) / current_price) * 100,
-            },
-            timestamp=time.time(),
-            source="market-research-server",
-            session_id=session_id,
-        )
-
-
-@dataclass
-class TradeExecutionEvent(MCPEvent):
-    """Trade execution result event."""
-    
-    @classmethod
-    def create(
-        cls,
-        user_id: int,
-        order_id: str,
-        symbol: str,
-        quantity: int,
-        action: str,
-        status: str,
-        price: Optional[float] = None,
-        session_id: Optional[str] = None,
-    ) -> "TradeExecutionEvent":
-        return cls(
-            topic=MCPTopics.EXECUTION_RESULTS,
-            user_id=user_id,
-            payload={
-                "order_id": order_id,
-                "symbol": symbol,
-                "quantity": quantity,
-                "action": action,
-                "status": status,
-                "price": price,
-            },
-            timestamp=time.time(),
-            source="execution-server",
-            session_id=session_id,
-        )
-
-
-@dataclass
-class StrategyRecommendationEvent(MCPEvent):
-    """Strategy recommendation event."""
-    
-    @classmethod
-    def create(
-        cls,
-        user_id: int,
-        symbol: str,
-        action: str,
-        confidence: float,
-        reasoning: List[str],
-        session_id: Optional[str] = None,
-    ) -> "StrategyRecommendationEvent":
-        return cls(
-            topic=MCPTopics.STRATEGY_RECOMMENDATIONS,
-            user_id=user_id,
-            payload={
-                "symbol": symbol,
-                "action": action,
-                "confidence": confidence,
-                "reasoning": reasoning,
-            },
-            timestamp=time.time(),
-            source="strategy-server",
-            session_id=session_id,
-        )
+# NOTE: The specialised event subclasses (MarketPredictionEvent,
+# TradeExecutionEvent, StrategyRecommendationEvent) were removed during
+# cleanup — they were never instantiated by any module.  If you need typed
+# events in the future, create them in the module that publishes them.
 
 
 # ---------------------------------------------------------------------------
@@ -202,15 +116,17 @@ class MCPEventBus:
         self._listener_task: Optional[asyncio.Task] = None
     
     async def connect(self) -> None:
-        """Connect to Redis."""
+        """Connect to Redis and verify connectivity with PING."""
         if self._redis is None:
             self._redis = redis.from_url(
                 self.redis_url,
                 db=self.db,
                 decode_responses=True,
             )
-            logger.info(f"Connected to Redis at {self.redis_url}")
-        if self._pubsub is None and self._redis is not None:
+        # Verify real connectivity (lazy client won't fail until first command)
+        await self._redis.ping()
+        logger.info(f"Connected to Redis at {self.redis_url}")
+        if self._pubsub is None:
             self._pubsub = self._redis.pubsub()
     
     async def disconnect(self) -> None:
@@ -295,31 +211,50 @@ class MCPEventBus:
             logger.info(f"Unsubscribed from {topic}")
     
     async def _listen(self) -> None:
-        """Internal listener loop for pub/sub messages."""
-        try:
-            if self._pubsub is None:
-                raise RuntimeError("Redis pubsub not initialized")
-            async for message in self._pubsub.listen():
-                if message["type"] == "message":
-                    topic = message["channel"]
-                    data = message["data"]
-                    try:
-                        event = MCPEvent.from_json(data)
-                        callbacks = self._subscriptions.get(topic, [])
-                        for callback in callbacks:
-                            try:
-                                result = callback(event)
-                                if asyncio.iscoroutine(result):
-                                    await result
-                            except Exception as exc:
-                                logger.error(f"Callback error for {topic}: {exc}")
-                    except json.JSONDecodeError as exc:
-                        logger.error(f"Invalid JSON on {topic}: {exc}")
-        except asyncio.CancelledError:
-            logger.info("Event listener cancelled")
-            raise
-        except Exception as exc:
-            logger.error(f"Event listener error: {exc}")
+        """Internal listener loop with automatic reconnection on failure.
+
+        On transient errors the loop waits with exponential back-off
+        (1 s → 2 s → 4 s … capped at 30 s) and re-subscribes.
+        """
+        backoff = 1.0
+        max_backoff = 30.0
+        while True:
+            try:
+                if self._pubsub is None:
+                    raise RuntimeError("Redis pubsub not initialized")
+                async for message in self._pubsub.listen():
+                    backoff = 1.0  # reset on every successful message
+                    if message["type"] == "message":
+                        topic = message["channel"]
+                        data = message["data"]
+                        try:
+                            event = MCPEvent.from_json(data)
+                            callbacks = self._subscriptions.get(topic, [])
+                            for callback in callbacks:
+                                try:
+                                    result = callback(event)
+                                    if asyncio.iscoroutine(result):
+                                        await result
+                                except Exception as exc:
+                                    logger.error(f"Callback error for {topic}: {exc}")
+                        except json.JSONDecodeError as exc:
+                            logger.error(f"Invalid JSON on {topic}: {exc}")
+            except asyncio.CancelledError:
+                logger.info("Event listener cancelled")
+                raise
+            except Exception as exc:
+                logger.warning(f"Event listener error (reconnecting in {backoff:.0f}s): {exc}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+                # Attempt to re-establish pubsub and re-subscribe
+                try:
+                    if self._redis:
+                        self._pubsub = self._redis.pubsub()
+                        for topic in self._subscriptions:
+                            await self._pubsub.subscribe(topic)
+                        logger.info("Re-subscribed to %d topics after reconnect", len(self._subscriptions))
+                except Exception as re_exc:
+                    logger.error(f"Reconnection failed: {re_exc}")
 
 
 # ---------------------------------------------------------------------------
