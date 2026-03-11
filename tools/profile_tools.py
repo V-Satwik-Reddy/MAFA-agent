@@ -32,44 +32,14 @@ DELETE /watchlist/{symbol}               → ApiResponse { data: {symbol, remove
 
 import json
 import logging
-import os
 from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 from requests import RequestException
 
-from http_client import get, post, delete
+from tools._http_helpers import fetch_json as _fetch_json, post_json as _post_json, delete_json as _delete_json, unwrap as _unwrap, API_BASE, make_error_response as _err
 
 logger = logging.getLogger(__name__)
-
-API_BASE = os.getenv("BROKER_API_URL", "http://localhost:8080")
-
-
-# ── helpers ─────────────────────────────────────────────────────────────────
-
-def _fetch_json(url: str, timeout: int = 10) -> Any:
-    response = get(url, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
-def _post_json(url: str, body: Dict[str, Any], timeout: int = 15) -> Any:
-    response = post(url, json=body, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
-def _delete_json(url: str, timeout: int = 10) -> Any:
-    response = delete(url, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
-def _unwrap(payload: Any) -> Any:
-    """Extract .data from an ApiResponse wrapper when present."""
-    if isinstance(payload, dict) and "data" in payload:
-        return payload["data"]
-    return payload
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -77,19 +47,19 @@ def _unwrap(payload: Any) -> Any:
 # ═══════════════════════════════════════════════════════════════════════════
 
 @tool
-def get_current_stock_price(symbol: str) -> float:
+def get_current_stock_price(symbol: str) -> str:
     """Get the current (latest close) price for a single stock symbol.
 
     Calls MAFA-B  GET /stockprice?symbol=<symbol>
-    Returns: raw Double
+    Returns JSON: {"symbol": "AAPL", "price": 123.45} or error object.
     """
     symbol = symbol.upper().strip()
     try:
         payload = _fetch_json(f"{API_BASE}/stockprice?symbol={symbol}")
-        return float(payload)
+        return json.dumps({"symbol": symbol, "price": float(payload)})
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching price for {symbol}: {exc}")
-        return 0.0
+        return json.dumps(_err(exc, f"get price for {symbol}"))
 
 
 @tool
@@ -112,7 +82,7 @@ def get_bulk_stock_prices(symbols: str) -> str:
         return json.dumps(data, default=str) if data else "[]"
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching bulk prices: {exc}")
-        return json.dumps({"error": str(exc)})
+        return json.dumps(_err(exc, "get bulk stock prices"))
 
 
 @tool
@@ -128,7 +98,7 @@ def get_stock_change(symbol: str) -> str:
         return json.dumps(payload)
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching stock change for {symbol}: {exc}")
-        return json.dumps({"symbol": symbol, "error": str(exc)})
+        return json.dumps(_err(exc, f"get stock change for {symbol}"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -136,18 +106,19 @@ def get_stock_change(symbol: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 @tool
-def get_user_balance() -> float:
+def get_user_balance() -> str:
     """Fetch the user's current cash balance.
 
     Calls MAFA-B  GET /balance → ApiResponse { data: Double }
+    Returns JSON: {"balance": 12345.67} or error object.
     """
     try:
         payload = _fetch_json(f"{API_BASE}/balance")
         balance = _unwrap(payload)
-        return float(balance) if balance is not None else 0.0
+        return json.dumps({"balance": float(balance) if balance is not None else 0.0})
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching user balance: {exc}")
-        return 0.0
+        return json.dumps(_err(exc, "get user balance"))
 
 
 @tool
@@ -163,7 +134,7 @@ def get_user_holdings() -> str:
         return json.dumps(holdings) if isinstance(holdings, list) else json.dumps([])
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching user holdings: {exc}")
-        return json.dumps([])
+        return json.dumps(_err(exc, "get user holdings"))
 
 
 @tool
@@ -178,7 +149,7 @@ def get_user_profile() -> str:
         return json.dumps(profile, default=str) if profile else "{}"
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching user profile: {exc}")
-        return "{}"
+        return json.dumps(_err(exc, "get user profile"))
 
 
 @tool
@@ -195,7 +166,7 @@ def get_user_preferences() -> str:
         return json.dumps(prefs, default=str) if prefs else "{}"
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching user preferences: {exc}")
-        return "{}"
+        return json.dumps(_err(exc, "get user preferences"))
 
 
 @tool
@@ -227,7 +198,7 @@ def get_user_transactions(limit: Optional[int] = None, page: Optional[int] = Non
         return json.dumps([])
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching transactions: {exc}")
-        return json.dumps([])
+        return json.dumps(_err(exc, "get user transactions"))
 
 
 @tool
@@ -242,7 +213,7 @@ def get_dashboard() -> str:
         return json.dumps(payload) if isinstance(payload, list) else json.dumps([])
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching dashboard: {exc}")
-        return json.dumps([])
+        return json.dumps(_err(exc, "get portfolio dashboard"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -263,7 +234,7 @@ def get_company_by_symbol(symbol: str) -> str:
         return json.dumps(data) if data else "{}"
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching company {symbol}: {exc}")
-        return "{}"
+        return json.dumps(_err(exc, f"get company {symbol}"))
 
 
 @tool
@@ -285,7 +256,7 @@ def get_companies_by_symbols(symbols: str) -> str:
         return json.dumps(data) if isinstance(data, list) else json.dumps([])
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching companies bulk: {exc}")
-        return json.dumps([])
+        return json.dumps(_err(exc, "get companies by symbols"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -312,7 +283,7 @@ def get_portfolio_history(period: str = "LAST_30_DAYS", interval: str = "DAILY")
         return json.dumps(data, default=str) if isinstance(data, list) else json.dumps([])
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching portfolio history: {exc}")
-        return json.dumps([])
+        return json.dumps(_err(exc, "get portfolio history"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -332,7 +303,7 @@ def get_watchlist() -> str:
         return json.dumps(data, default=str) if isinstance(data, list) else json.dumps([])
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching watchlist: {exc}")
-        return json.dumps([])
+        return json.dumps(_err(exc, "get watchlist"))
 
 
 @tool
@@ -351,7 +322,7 @@ def add_to_watchlist(symbol: str) -> str:
         if hasattr(exc, 'response') and exc.response is not None and exc.response.status_code == 409:
             return json.dumps({"symbol": symbol, "error": "Already in watchlist"})
         logger.warning(f"Error adding {symbol} to watchlist: {exc}")
-        return json.dumps({"error": str(exc)})
+        return json.dumps(_err(exc, f"add {symbol} to watchlist"))
 
 
 @tool
@@ -370,4 +341,4 @@ def remove_from_watchlist(symbol: str) -> str:
         if hasattr(exc, 'response') and exc.response is not None and exc.response.status_code == 404:
             return json.dumps({"symbol": symbol, "error": "Not in watchlist"})
         logger.warning(f"Error removing {symbol} from watchlist: {exc}")
-        return json.dumps({"error": str(exc)})
+        return json.dumps(_err(exc, f"remove {symbol} from watchlist"))
