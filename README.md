@@ -1,6 +1,6 @@
 # MAFA-Agents
 
-Multi-Agent Financial Assistant powered by Model Context Protocol (MCP) and Google Gemini.
+Multi-Agent Financial Assistant powered by Model Context Protocol (MCP) and OpenRouter.
 
 ## Overview
 
@@ -22,7 +22,7 @@ MAFA-Agents is a sophisticated multi-agent system for financial analysis and tra
                       │
 ┌─────────────────────▼───────────────────────────────────────┐
 │                  MCP Orchestrator                           │
-│  (Google Gemini + Intent Classification + Tool Routing)     │
+│  (OpenRouter LLM + Intent Classification + Tool Routing)    │
 └─────────────────────┬───────────────────────────────────────┘
                       │
 ┌─────────────────────▼───────────────────────────────────────┐
@@ -78,10 +78,11 @@ docker run -d --name mafa-redis -p 6379:6379 redis:alpine
 # python -m uvicorn API:app --host 0.0.0.0 --port 5001  # Linux/Mac
 ```
 
-### Test the System
+### Smoke Test the System
 
 ```bash
-python test_system.py
+python -m uvicorn API:app --host 0.0.0.0 --port 5001
+# Then call /health and /mcp/query with a valid bearer token.
 ```
 
 ## API Endpoints
@@ -102,7 +103,6 @@ MAFA-agents/
 ├── mcp_orchestrator.py    # MCP orchestration logic
 ├── event_bus.py           # Redis pub/sub event bus
 ├── monitoring.py          # Logging & metrics
-├── config.py              # Environment configuration
 ├── vectordbsupabase.py    # Supabase vector DB client
 ├── http_client.py         # HTTP client utilities
 │
@@ -126,9 +126,6 @@ MAFA-agents/
 │   ├── memory_tools.py
 │   └── profile_tools.py
 │
-├── workflows/             # Multi-agent workflows
-│   └── basic_workflows.py
-│
 ├── lstm/                  # LSTM prediction models
 │   ├── infer.py
 │   ├── predict_next_day.py
@@ -143,7 +140,8 @@ Required environment variables (see `.env.example`):
 
 | Variable | Description |
 |----------|-------------|
-| `GOOGLE_API_KEY` | Google AI (Gemini) API key |
+| `OPENROUTER_API_KEY` | OpenRouter API key |
+| `OPENROUTER_MODEL` | OpenRouter model identifier (e.g. `openai/gpt-4o-mini`) |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_API_KEY` | Supabase anon/service key |
 | `CUSTOM_SEARCH_API_KEY` | Google Custom Search API key |

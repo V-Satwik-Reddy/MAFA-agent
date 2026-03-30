@@ -146,7 +146,7 @@ def predict(ticker: str) -> str:
         prediction_df = predict_next_day_price(ticker, prices_df)
         predicted_price = float(prediction_df)
         return json.dumps({"ticker": ticker, "predicted_close": round(predicted_price, 2)})
-    except (RequestException, ValueError, TypeError) as exc:
+    except (RequestException, ValueError, TypeError, RuntimeError, ImportError) as exc:
         logger.warning("Prediction failed for %s: %s", ticker, exc)
         return json.dumps({"ticker": ticker, "error": f"Prediction failed: {exc}"})
 

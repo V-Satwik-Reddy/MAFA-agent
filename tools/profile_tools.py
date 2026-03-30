@@ -193,8 +193,9 @@ def get_user_transactions(limit: Optional[int] = None, page: Optional[int] = Non
             params.append(f"period={period.upper()}")
         qs = f"?{'&'.join(params)}" if params else ""
         payload = _fetch_json(f"{API_BASE}/transactions{qs}")
-        if isinstance(payload, list):
-            return json.dumps(payload, default=str)
+        data = _unwrap(payload)
+        if isinstance(data, list):
+            return json.dumps(data, default=str)
         return json.dumps([])
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching transactions: {exc}")
@@ -210,7 +211,8 @@ def get_dashboard() -> str:
     """
     try:
         payload = _fetch_json(f"{API_BASE}/dashboard")
-        return json.dumps(payload) if isinstance(payload, list) else json.dumps([])
+        data = _unwrap(payload)
+        return json.dumps(data, default=str) if isinstance(data, list) else json.dumps([])
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching dashboard: {exc}")
         return json.dumps(_err(exc, "get portfolio dashboard"))

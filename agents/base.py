@@ -7,10 +7,11 @@ instance is shared across all agents (lower memory, faster cold-start).
 
 import logging
 import os
+import re
 import time
 
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 
 from tools.memory_tools import retrieve_user_context, store_user_context
@@ -22,13 +23,33 @@ logger = logging.getLogger(__name__)
 
 # ── Shared singletons (created once, reused by all agents) ────────────────
 
-_google_api_key = os.getenv("GOOGLE_API_KEY")
-if not _google_api_key:
-    raise RuntimeError("Missing GOOGLE_API_KEY environment variable")
-os.environ["GOOGLE_API_KEY"] = _google_api_key
+_openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+if not _openrouter_api_key:
+    raise RuntimeError("Missing OPENROUTER_API_KEY environment variable")
 
-model = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
-vector_db = SupabaseVectorDB()
+_openrouter_base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+_openrouter_model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+
+model = ChatOpenAI(
+    model=_openrouter_model,
+    api_key=_openrouter_api_key,
+    base_url=_openrouter_base_url,
+    temperature=0,
+)
+
+_vector_db = None  # Lazy initialization
+
+def get_vector_db():
+    """Get or initialize the vector database lazily."""
+    global _vector_db
+    if _vector_db is None:
+        try:
+            _vector_db = SupabaseVectorDB()
+        except Exception as e:
+            logger.warning(f"Vector DB initialization failed: {e}. Context memory will be unavailable.")
+            return None
+    return _vector_db
+
 checkpointer = MemorySaver()
 
 # Track which threads have already had at least one turn (to avoid
@@ -47,8 +68,12 @@ def build_system_message(user_id: int, user_message: str) -> str | None:
 
     Returns a formatted history string or *None* if nothing relevant was found.
     """
+    db = get_vector_db()
+    if not db:
+        return None
+    
     try:
-        query_emb = vector_db.embed_text(user_message)
+        query_emb = db.embed_text(user_message)
         rows = retrieve_user_context(
             user_id=str(user_id),
             agent="shared_context",
@@ -62,7 +87,7 @@ def build_system_message(user_id: int, user_message: str) -> str | None:
 
     if not rows:
         try:
-            rows = vector_db.latest_records(user_id=str(user_id), agent=None, limit=5)
+            rows = db.latest_records(user_id=str(user_id), agent=None, limit=5)
         except Exception as exc:
             logger.warning("Vector memory latest-records fallback failed: %s", exc)
             rows = []
@@ -92,7 +117,7 @@ def normalize_content(content) -> str:
     """Extract plain text from a LangChain message content field.
 
     Handles both plain-string content and the list-of-parts format
-    returned by some Gemini models.
+    returned by some chat model providers.
     """
     if isinstance(content, list):
         return "".join(
@@ -101,6 +126,79 @@ def normalize_content(content) -> str:
             if isinstance(part, dict) and part.get("type") == "text"
         )
     return str(content) if content else ""
+
+
+def sanitize_user_response(text: str, user_message: str | None = None) -> str:
+    """Sanitize user-facing responses to remove internal/process leakage.
+
+    This is a final guard after model generation to keep responses concise,
+    data-grounded, and free from implementation details.
+    """
+    if not isinstance(text, str):
+        return ""
+
+    cleaned = text
+    query = (user_message or "").lower()
+
+    injection_markers = (
+        "hidden instructions",
+        "system prompt",
+        "developer prompt",
+        "tool schema",
+        "internal tool",
+        "show your prompt",
+        "reveal prompt",
+        "ignore previous instructions",
+        "jailbreak",
+    )
+    if any(m in query for m in injection_markers):
+        return (
+            "I can't provide internal instructions or system configuration details. "
+            "I can still help with your portfolio, market research, strategy, or trade-execution request."
+        )
+
+    banned_fragments = (
+        "point-in-time data from mafa-b services",
+        "internal process",
+        "background process",
+        "tool schema",
+        "hidden system prompt",
+        "internal memory notes",
+        "i will store these key findings",
+        "i'll store these key findings",
+        "stored to memory",
+        "saving this to memory",
+    )
+    for frag in banned_fragments:
+        cleaned = re.sub(re.escape(frag), "", cleaned, flags=re.IGNORECASE)
+
+    # Remove references to prompt disclosure or policy internals if they appear.
+    cleaned = re.sub(r"(?im)^.*(system prompt|developer prompt|hidden instruction|tool schema).*$", "", cleaned)
+
+    # Remove noisy empty markdown headers or leftover punctuation fragments.
+    cleaned = re.sub(r"(?m)^\s*#{2,}\s*$", "", cleaned)
+
+    # For strict/data-only requests, remove generic "next step" fluff.
+    strict_query = (user_message or "").lower()
+    strict_markers = (
+        "exact",
+        "strict",
+        "numbers only",
+        "just tell me",
+        "no assumptions",
+        "no commentary",
+        "only factual",
+    )
+    if any(m in strict_query for m in strict_markers):
+        cleaned = re.sub(r"(?im)^\s*next\s*step\s*:.*$", "", cleaned)
+        cleaned = re.sub(r"(?im)^\s*would\s+you\s+like\s+.*$", "", cleaned)
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    if not cleaned:
+        return "I can help with that. Please share the exact portfolio, strategy, or execution question you want answered."
+
+    return cleaned
 
 
 def run_agent_turn(
@@ -171,6 +269,8 @@ def run_agent_turn(
         if not agent_reply.strip():
             agent_reply = "I processed your request but wasn't able to produce a response. Please try rephrasing your question."
             logger.warning("│  Agent produced empty reply for: %s", user_message)
+
+    agent_reply = sanitize_user_response(agent_reply, user_message=user_message)
 
     elapsed = time.perf_counter() - start
     logger.info("│  A: %.300s", agent_reply)

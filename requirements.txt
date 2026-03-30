@@ -17,9 +17,9 @@ httpx>=0.24.0
 # AI & LLM Framework
 # -----------------------------------------------------------------------------
 langchain>=0.1.0
-langchain-google-genai>=0.0.6
+langchain-openai>=0.2.0
+openai>=1.40.0
 langgraph>=0.0.20
-google-generativeai>=0.3.0
 
 # -----------------------------------------------------------------------------
 # Model Context Protocol (MCP)

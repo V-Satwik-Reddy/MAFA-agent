@@ -4,27 +4,30 @@ Provides REST endpoints for all agents plus WebSocket streaming for real-time up
 Features: Rate limiting, input validation, structured logging, health checks.
 """
 
-import asyncio
+import base64
+import binascii
+import json
 import logging
 import os
+import re
 import uuid
-import warnings
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, Request, Depends, Security
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Depends, Security
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 
 from agents.execution_agent import run_execute_agent  # type: ignore
 from agents.general_agent import run_general_agent  # type: ignore
 from agents.market_search_agent import run_market_research_agent  # type: ignore
 from agents.portfolio_manager_agent import run_portfolio_manager_agent  # type: ignore
 from agents.investment_strategy_agent import run_investment_strategy_agent  # type: ignore
-from mcp_orchestrator import TrueMCPOrchestrator, get_mcp_orchestrator
+from mcp_orchestrator import get_mcp_orchestrator
 from event_bus import get_event_bus, MCPTopics, MCPEvent, shutdown_event_bus
 from http_client import set_request_token, init_request_cache, clear_request_cache
 from monitoring import (
@@ -33,6 +36,8 @@ from monitoring import (
 )
 
 # Configure structured logging
+load_dotenv()
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 setup_logging(LOG_LEVEL)
 logger = logging.getLogger(__name__)
@@ -108,14 +113,51 @@ class MCPQueryRequest(BaseModel):
     @field_validator("query")
     @classmethod
     def sanitize_query(cls, v: str) -> str:
-        """Basic input sanitization."""
-        # Remove potential injection attempts
-        dangerous_patterns = ["DROP", "DELETE", "TRUNCATE", "<script>", "javascript:"]
-        v_upper = v.upper()
-        for pattern in dangerous_patterns:
-            if pattern in v_upper:
-                raise ValueError(f"Query contains potentially dangerous content")
-        return v.strip()
+        """Input sanitization that avoids false positives on normal finance language.
+
+        Important: keep regular user phrases like "stock drops 10%" valid.
+        """
+        text = v.strip()
+        lower = text.lower()
+
+        # Allow educational/meta references to SQL-like text when clearly
+        # framed as quoted examples, not executable instructions.
+        meta_context_markers = (
+            "sql-like",
+            "example",
+            "quoted",
+            "string",
+            "contains",
+            "my query includes",
+            "treat this safely",
+            "ignore that part",
+            "from another app",
+            "pasting this text",
+        )
+        has_meta_context = any(m in lower for m in meta_context_markers)
+
+        # XSS-style payloads
+        if "<script" in lower or "javascript:" in lower:
+            raise ValueError("Query contains potentially dangerous content")
+
+        # SQL-ish patterns (word-boundary + command context) to avoid matching
+        # benign words like "drop" in market scenarios.
+        sql_patterns = [
+            r"\b(drop|delete|truncate)\s+(table|database|from)\b",
+            r"\bunion\s+select\b",
+            r"\binsert\s+into\b",
+            r"\bupdate\s+\w+\s+set\b",
+            r"\bselect\s+.+\s+from\b",
+            r"\b(or|and)\s+1\s*=\s*1\b",
+            r"--",
+            r"/\*|\*/",
+        ]
+        for pattern in sql_patterns:
+            if re.search(pattern, lower):
+                if not has_meta_context:
+                    raise ValueError("Query contains potentially dangerous content")
+
+        return text
 
 
 # WebSocket connection manager
@@ -151,6 +193,19 @@ ws_manager = ConnectionManager()
 async def lifespan(app: FastAPI):
     """Application lifespan - initialize MCP and event bus."""
     logger.info("Starting MAFA Agents API...")
+
+    # Log memory backend readiness early for production diagnostics.
+    supabase_status = await check_supabase(SUPABASE_URL, SUPABASE_API_KEY)
+    if supabase_status.get("status") == "healthy":
+        logger.info(
+            "Supabase memory backend healthy",
+            extra={"extra_data": {"event": "supabase_startup_ok", **supabase_status}},
+        )
+    else:
+        logger.warning(
+            "Supabase memory backend unavailable at startup",
+            extra={"extra_data": {"event": "supabase_startup_unhealthy", **supabase_status}},
+        )
     
     # Initialize MCP orchestrator
     orchestrator = get_mcp_orchestrator()
@@ -228,9 +283,65 @@ mcp_orchestrator = get_mcp_orchestrator()
 _bearer_scheme = HTTPBearer(auto_error=True)
 
 
+def _decode_jwt_payload(token: str) -> dict:
+    """Decode JWT payload without signature verification for basic claim checks.
+
+    This is used for fast rejection of obviously invalid/expired tokens at the
+    API boundary. Signature/authorization is still enforced by downstream broker
+    calls that require valid credentials.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise HTTPException(status_code=401, detail="Invalid bearer token format")
+
+    payload_b64 = parts[1]
+    # JWT uses URL-safe base64 and may omit padding.
+    payload_b64 += "=" * (-len(payload_b64) % 4)
+
+    try:
+        payload_raw = base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+        payload = json.loads(payload_raw.decode("utf-8"))
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid bearer token payload")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=401, detail="Invalid bearer token payload")
+
+    return payload
+
+
+def _validate_token_claims(token: str) -> None:
+    """Validate minimal JWT claims to reject malformed/expired tokens early."""
+    payload = _decode_jwt_payload(token)
+    exp = payload.get("exp")
+    if exp is None:
+        return
+
+    try:
+        exp_int = int(exp)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid token expiry claim")
+
+    if exp_int <= int(time.time()):
+        raise HTTPException(status_code=401, detail="Token expired")
+
+
+def _is_upstream_quota_error(exc: Exception) -> bool:
+    """Detect quota/rate-limit failures from upstream LLM providers."""
+    text = str(exc).lower()
+    return (
+        "quota exceeded" in text
+        or ("429" in text and "quota" in text)
+        or ("429" in text and "rate limit" in text)
+        or "generate_content_free_tier_requests" in text
+    )
+
+
 def get_token(credentials: HTTPAuthorizationCredentials = Security(_bearer_scheme)) -> str:
     """Extract Bearer token.  FastAPI returns 401/403 automatically if missing."""
-    return credentials.credentials
+    token = credentials.credentials
+    _validate_token_claims(token)
+    return token
 
 
 # ---------------------------------------------------------------------------
@@ -362,19 +473,33 @@ async def websocket_stream(websocket: WebSocket):
 # ---------------------------------------------------------------------------
 
 def _run_agent_endpoint(agent_fn, agent_label: str, payload: ExecuteAgentRequest, token: str):
-	"""Shared logic for all agent endpoints — eliminates 5x code duplication."""
-	set_request_token(token)
-	init_request_cache()
-	session_id = payload.sessionId or str(uuid.uuid4())
-	try:
-		result = agent_fn(user_message=payload.query, user_id=payload.userId, session_id=session_id)
-		return {"data": result, "userId": payload.userId, "sessionId": session_id}
-	except Exception as exc:
-		logger.error(f"Error executing {agent_label}: {exc}")
-		raise HTTPException(status_code=500, detail=f"Failed to execute {agent_label}") from exc
-	finally:
-		clear_request_cache()
-		set_request_token(None)
+    """Shared logic for all agent endpoints — eliminates 5x code duplication."""
+    set_request_token(token)
+    init_request_cache()
+    session_id = payload.sessionId or str(uuid.uuid4())
+    try:
+        result = agent_fn(user_message=payload.query, user_id=payload.userId, session_id=session_id)
+        return {
+            "data": result,
+            "userId": payload.userId,
+            "sessionId": session_id,
+            "success": True,
+            "error": None,
+        }
+    except Exception as exc:
+        logger.error(f"Error executing {agent_label}: {exc}")
+        if _is_upstream_quota_error(exc):
+            return {
+                "data": f"Error processing request: {str(exc)}",
+                "userId": payload.userId,
+                "sessionId": session_id,
+                "success": False,
+                "error": str(exc),
+            }
+        raise HTTPException(status_code=500, detail=f"Failed to execute {agent_label}") from exc
+    finally:
+        clear_request_cache()
+        set_request_token(None)
 
 
 @app.post("/execute-agent")

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import time
+from urllib.parse import urlparse
 from datetime import datetime
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional
@@ -277,15 +278,35 @@ async def check_redis(redis_url: str = "redis://localhost:6379") -> Dict[str, An
 
 
 async def check_supabase(url: str, key: str) -> Dict[str, Any]:
-    """Check Supabase connectivity with a real query."""
+    """Check Supabase connectivity using the same path as runtime memory tools."""
+    if not url or not key:
+        return {
+            "status": "unhealthy",
+            "error": "SUPABASE_URL or SUPABASE_API_KEY is missing",
+        }
     try:
-        from supabase import create_client
-        client = create_client(url, key)
-        # Do a real lightweight query — fetch 0 rows from the memory table
-        result = client.table("agent_memory").select("id").limit(1).execute()
-        return {"status": "healthy", "url": url}
+        from vectordbsupabase import get_supabase_client
+
+        table_name = os.getenv("SUPABASE_VECTOR_TABLE", "agent_memory")
+        client = get_supabase_client()
+        # Lightweight reachability query against configured memory table.
+        client.table(table_name).select("id").limit(1).execute()
+        return {
+            "status": "healthy",
+            "url": url,
+            "table": table_name,
+        }
     except Exception as e:
-        return {"status": "unhealthy", "error": str(e)}
+        error_text = str(e)
+        if "getaddrinfo failed" in error_text.lower():
+            host = urlparse(url).hostname or "unknown"
+            return {
+                "status": "unhealthy",
+                "error": error_text,
+                "hint": "Supabase hostname could not be resolved. Verify SUPABASE_URL project ref/domain.",
+                "host": host,
+            }
+        return {"status": "unhealthy", "error": error_text}
 
 
 async def check_broker_api(url: str) -> Dict[str, Any]:

@@ -60,7 +60,7 @@ def _get_holdings() -> List[Dict]:
 def _get_dashboard() -> List[Dict]:
     """List<StockDto>  each: {symbol, shares, totalAmount, currentPrice, avgBuyPrice, gainLoss}"""
     try:
-        data = _fetch_json(f"{API_BASE}/dashboard")
+        data = _unwrap(_fetch_json(f"{API_BASE}/dashboard"))
         return data if isinstance(data, list) else []
     except Exception as exc:
         raise_on_auth(exc)

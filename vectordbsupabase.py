@@ -4,11 +4,12 @@ import os
 import socket
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
+from openai import OpenAI
 from dotenv import load_dotenv
 from supabase import Client, create_client
-from supabase.lib.client_options import SyncClientOptions
 
 load_dotenv()
 
@@ -19,31 +20,47 @@ logger = logging.getLogger(__name__)
 # a blocking proxy.  We resolve via Google DoH and patch socket.getaddrinfo
 # so every library (httpx, supabase-py, etc.) connects to the real IP.
 # ---------------------------------------------------------------------------
-_SUPABASE_HOST = os.getenv("SUPABASE_URL", "").replace("https://", "").replace("http://", "").strip("/")
+_supabase_url = os.getenv("SUPABASE_URL", "").strip()
+_SUPABASE_HOST = urlparse(_supabase_url).hostname or _supabase_url.replace("https://", "").replace("http://", "").strip("/")
 _DNS_OVERRIDE: dict[str, str] = {}  # hostname -> real IP
+_ENABLE_DOH_OVERRIDE = os.getenv("SUPABASE_DOH_OVERRIDE", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 def _resolve_via_doh(hostname: str) -> str | None:
-    """Resolve *hostname* using Google DNS-over-HTTPS (bypasses ISP DNS)."""
+    """Resolve *hostname* using public DNS-over-HTTPS providers."""
+    endpoints = (
+        "https://dns.google/resolve",
+        "https://cloudflare-dns.com/dns-query",
+    )
     try:
-        import urllib.request, json
-        url = f"https://8.8.8.8/resolve?name={hostname}&type=A"
-        req = urllib.request.Request(url, headers={"Accept": "application/dns-json"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-            for ans in data.get("Answer", []):
-                if ans.get("type") == 1:  # A record
-                    return ans["data"]
+        for endpoint in endpoints:
+            try:
+                resp = httpx.get(
+                    endpoint,
+                    params={"name": hostname, "type": "A"},
+                    headers={"Accept": "application/dns-json"},
+                    timeout=5.0,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                for ans in data.get("Answer", []):
+                    if ans.get("type") == 1 and isinstance(ans.get("data"), str):
+                        return ans["data"]
+            except Exception as inner_exc:
+                logger.debug("DoH endpoint failed (%s): %s", endpoint, inner_exc)
     except Exception as exc:
         logger.debug("DoH resolution failed for %s: %s", hostname, exc)
     return None
 
 def _bootstrap_dns_override():
     """Resolve the Supabase host once at import time and patch getaddrinfo."""
+    if not _ENABLE_DOH_OVERRIDE:
+        logger.info("SUPABASE_DOH_OVERRIDE disabled; using system DNS resolution.")
+        return
     if not _SUPABASE_HOST:
         return
     real_ip = _resolve_via_doh(_SUPABASE_HOST)
     if not real_ip:
-        logger.warning("Could not resolve %s via DoH; Supabase may be unreachable", _SUPABASE_HOST)
+        logger.warning("Could not resolve %s via DoH; falling back to system DNS", _SUPABASE_HOST)
         return
     _DNS_OVERRIDE[_SUPABASE_HOST] = real_ip
     logger.info("DNS override: %s -> %s (bypassing ISP hijack)", _SUPABASE_HOST, real_ip)
@@ -63,7 +80,7 @@ _bootstrap_dns_override()
 DEFAULT_TABLE = os.getenv("SUPABASE_VECTOR_TABLE", "agent_memory")
 DEFAULT_RPC_FN = os.getenv("SUPABASE_VECTOR_MATCH_FN", "match_agent_context")
 DEFAULT_EMBED_DIM = int(os.getenv("SUPABASE_VECTOR_DIM", "768"))
-DEFAULT_EMBED_MODEL = os.getenv("SUPABASE_EMBEDDING_MODEL", "gemini-embedding-001")
+DEFAULT_EMBED_MODEL = os.getenv("SUPABASE_EMBEDDING_MODEL", "text-embedding-3-small")
 
 
 def build_schema_sql(
@@ -129,14 +146,13 @@ def get_supabase_client() -> Client:
     key = os.getenv("SUPABASE_API_KEY")
     if not url or not key:
         raise RuntimeError("SUPABASE_URL and SUPABASE_API_KEY must be set in the environment.")
-    # Use a custom httpx client that skips SSL verification to work around
-    # ISP-level TLS interception (Excitel MITM proxy replaces Supabase certs).
-    options = SyncClientOptions(httpx_client=httpx.Client(verify=False))
-    return create_client(url, key, options=options)
+    # Create client using standard options (SSL verification handled by environment)
+    # For custom SSL handling, set REQUESTS_CA_BUNDLE or similar env vars
+    return create_client(url, key)
 
 
 class SupabaseVectorDB:
-    _genai_module = None  # Class-level cache: import + configure genai once
+    _embed_client = None  # Class-level cache: OpenRouter/OpenAI client singleton
 
     def __init__(
         self,
@@ -154,31 +170,28 @@ class SupabaseVectorDB:
         return build_schema_sql(self.table_name, self.embedding_dim, self.rpc_fn)
 
     @classmethod
-    def _init_genai(cls):
-        """Import and configure google.genai Client exactly once."""
-        if cls._genai_module is None:
-            api_key = os.getenv("GOOGLE_API_KEY")
+    def _init_embed_client(cls):
+        """Create an OpenAI-compatible embeddings client (OpenRouter) once."""
+        if cls._embed_client is None:
+            api_key = os.getenv("OPENROUTER_API_KEY")
             if not api_key:
-                raise RuntimeError("GOOGLE_API_KEY is required for automatic embeddings.")
-            from google import genai as _genai
-            cls._genai_module = _genai.Client(api_key=api_key)
-        return cls._genai_module
+                raise RuntimeError("OPENROUTER_API_KEY is required for automatic embeddings.")
+            base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+            cls._embed_client = OpenAI(api_key=api_key, base_url=base_url)
+        return cls._embed_client
 
     def embed_text(self, text: str, model: Optional[str] = None) -> List[float]:
-        """Generate embeddings using google.genai SDK (gemini-embedding-001)."""
-        client = self._init_genai()
-        from google.genai import types as _gentypes
+        """Generate embeddings using OpenAI-compatible embeddings endpoint."""
+        client = self._init_embed_client()
 
         target_model = model or DEFAULT_EMBED_MODEL
         try:
-            response = client.models.embed_content(
+            response = client.embeddings.create(
                 model=target_model,
-                contents=text,
-                config=_gentypes.EmbedContentConfig(
-                    output_dimensionality=self.embedding_dim,
-                ),
+                input=text,
+                dimensions=self.embedding_dim,
             )
-            embedding = list(response.embeddings[0].values)
+            embedding = list(response.data[0].embedding)
             return self._validate_embedding(embedding)
         except Exception as exc:
             logger.error("Embedding failed for model %s: %s", target_model, exc)

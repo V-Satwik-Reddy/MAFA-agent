@@ -9,7 +9,18 @@ logger = logging.getLogger(__name__)
 
 SHARED_AGENT_NAME = "shared_context"
 
-vector_db = SupabaseVectorDB()
+_vector_db = None  # Lazy initialization
+
+def _get_vector_db():
+    """Get or initialize the vector database."""
+    global _vector_db
+    if _vector_db is None:
+        try:
+            _vector_db = SupabaseVectorDB()
+        except Exception as e:
+            logger.warning(f"Vector DB initialization failed: {e}. Memory tools will be unavailable.")
+            return None
+    return _vector_db
 
 
 def store_user_context(
@@ -24,8 +35,11 @@ def store_user_context(
     if metadata:
         merged_metadata.update(metadata)
     try:
-        vector = embedding or vector_db.embed_text(content)
-        return vector_db.upsert_record(
+        db = _get_vector_db()
+        if not db:
+            return ""
+        vector = embedding or db.embed_text(content)
+        return db.upsert_record(
             user_id=user_id,
             agent=SHARED_AGENT_NAME,
             content=content,
@@ -46,7 +60,10 @@ def retrieve_user_context(
 ) -> List[Dict[str, Any]]:
     """Retrieve similar context entries for a user across all agents using vector search."""
     try:
-        return vector_db.similarity_search(
+        db = _get_vector_db()
+        if not db:
+            return []
+        return db.similarity_search(
             user_id=user_id,
             agent=None,
             query_embedding=query_embedding,
@@ -61,7 +78,10 @@ def retrieve_user_context(
 def supabase_vector_schema_sql() -> str:
     """Return SQL required to provision the Supabase vector table and RPC."""
     try:
-        return vector_db.schema_sql()
+        db = _get_vector_db()
+        if not db:
+            return ""
+        return db.schema_sql()
     except Exception as exc:
         logger.warning("Error generating schema SQL: %s", exc)
         return ""
@@ -93,7 +113,10 @@ def search_user_memory(query: str, user_id: str) -> str:
     Returns the most relevant past interactions matching the query.
     """
     try:
-        emb = vector_db.embed_text(query)
+        db = _get_vector_db()
+        if not db:
+            return "Memory service is currently unavailable."
+        emb = db.embed_text(query)
         rows = retrieve_user_context(
             user_id=str(user_id),
             agent=SHARED_AGENT_NAME,

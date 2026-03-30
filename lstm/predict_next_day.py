@@ -18,8 +18,6 @@ from typing import Union
 
 import pandas as pd
 
-from lstm.infer import ModelWrapper
-
 
 def predict_next_day_price(ticker: str, recent_prices: pd.DataFrame) -> float:
     """Predict the next-day close for ``ticker`` using its saved LSTM model.
@@ -36,6 +34,11 @@ def predict_next_day_price(ticker: str, recent_prices: pd.DataFrame) -> float:
     """
     if len(recent_prices) < 21:
         raise ValueError("Need at least 21 rows (20 for input window, 1 target) of recent prices")
+
+    try:
+        from lstm.infer import ModelWrapper
+    except Exception as exc:
+        raise RuntimeError(f"LSTM runtime is unavailable in this environment: {exc}") from exc
 
     model_dir = os.path.join("lstm", "output", ticker)
     if not os.path.exists(os.path.join(model_dir, "model.keras")):
